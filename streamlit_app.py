@@ -1,11 +1,27 @@
 import streamlit as st
-import requests
 import os
+import shutil
+from pathlib import Path
+from docling.document_converter import DocumentConverter
+import app.history as history
+from app.chat import chat_with_data
+from app.consolidator import generate_summary
 
 # --- Configuration ---
-API_BASE_URL = "http://127.0.0.1:8000"
-
 st.set_page_config(page_title="Book Gen Pipeline", layout="wide")
+
+# Validating API Key
+if not os.getenv("GEMINI_API_KEY"):
+    st.error("⚠️ GENAI_API_KEY is missing! Please set it in your .env file or Streamlit secrets.")
+
+# Setup Directories
+UPLOAD_DIR = Path("uploaded_files")
+OUTPUT_DIR = Path("extracted_docs")
+CONSOLIDATED_DIR = Path("consolidated_docs")
+
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+CONSOLIDATED_DIR.mkdir(exist_ok=True)
 
 st.title("📚 Book Generation Pipeline")
 st.markdown("Upload content, consolidate it into a Knowledge Base, and chat with your data.")
@@ -25,21 +41,34 @@ with st.sidebar:
             total_files = len(uploaded_files)
             
             for index, uploaded_file in enumerate(uploaded_files):
-                st.write(f"Processing: *{uploaded_file.name}*...")
+                status_text = st.empty()
+                status_text.write(f"Processing: *{uploaded_file.name}*...")
                 
-                # Prepare file for upload
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                # Save uploaded file to disk
+                file_path = UPLOAD_DIR / uploaded_file.name
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
                 
                 try:
-                    response = requests.post(f"{API_BASE_URL}/extract/", files=files)
-                    if response.status_code == 200:
-                        st.success(f"✅ Extracted: {uploaded_file.name}")
-                    else:
-                        st.error(f"❌ Failed: {uploaded_file.name} - {response.text}")
+                    # Initialize converter and convert
+                    # Note: We re-init converter to keep it simple, but caching is possible
+                    converter = DocumentConverter()
+                    result = converter.convert(file_path)
+                    md_content = result.document.export_to_markdown()
+                    
+                    # Save markdown
+                    output_filename = f"{file_path.stem}.md"
+                    output_path = OUTPUT_DIR / output_filename
+                    
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        f.write(md_content)
+                        
+                    st.success(f"✅ Extracted: {uploaded_file.name}")
                 except Exception as e:
-                    st.error(f"❌ Error connecting to server: {e}")
+                    st.error(f"❌ Failed: {uploaded_file.name} - {str(e)}")
                 
                 progress_bar.progress((index + 1) / total_files)
+                status_text.empty()
 
     st.divider()
     
@@ -49,15 +78,31 @@ with st.sidebar:
     if st.button("Generate Base Context"):
         with st.spinner("Consolidating with Gemini... This may take a minute."):
             try:
-                response = requests.post(f"{API_BASE_URL}/consolidate/")
-                if response.status_code == 200:
-                    data = response.json()
-                    st.success("✅ Consolidation Complete!")
-                    st.markdown(f"**Output:** `{data['file']}`")
+                # 1. Read all markdown files from extracted_docs
+                md_files = list(OUTPUT_DIR.glob("*.md"))
+                if not md_files:
+                    st.warning("No extracted documents found to consolidate.")
                 else:
-                    st.error(f"❌ Failed: {response.text}")
+                    combined_text = ""
+                    for md_file in md_files:
+                        with open(md_file, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            combined_text += f"\n\n--- START OF FILE: {md_file.name} ---\n\n"
+                            combined_text += content
+                            combined_text += f"\n\n--- END OF FILE: {md_file.name} ---\n\n"
+                    
+                    # 2. Call Gemini Consolidator
+                    summary_md = generate_summary(combined_text)
+                    
+                    # 3. Save to consolidated_docs
+                    output_file = CONSOLIDATED_DIR / "base_context.md"
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(summary_md)
+                        
+                    st.success("✅ Consolidation Complete!")
+                    st.markdown(f"**Output saved to:** `{output_file}`")
             except Exception as e:
-                st.error(f"❌ Connection Error: {e}")
+                st.error(f"❌ Error during consolidation: {e}")
 
 # --- Main Area: Chat ---
 st.divider()
@@ -73,64 +118,46 @@ with st.sidebar:
     st.header("Chat Sessions")
     
     if st.button("➕ New Chat"):
-        try:
-            res = requests.post(f"{API_BASE_URL}/sessions/")
-            if res.status_code == 200:
-                new_id = res.json()["session_id"]
-                st.session_state["current_session_id"] = new_id
-                st.session_state.messages = [] # Clear local view
-                st.rerun()
-        except Exception as e:
-            st.error(f"Failed to create session: {e}")
+        new_id = history.create_session()
+        st.session_state["current_session_id"] = new_id
+        st.session_state.messages = [] # Clear local view
+        st.rerun()
 
     # List recent sessions
     try:
-        res = requests.get(f"{API_BASE_URL}/sessions/")
-        if res.status_code == 200:
-            sessions = res.json()
-            for sess in sessions:
-                label = f"Session {sess['id'][:8]}... ({sess['message_count']} msgs)"
-                if st.button(label, key=sess["id"]):
-                    st.session_state["current_session_id"] = sess["id"]
-                    st.rerun()
+        sessions = history.list_sessions()
+        for sess in sessions:
+            label = f"Session {sess['id'][:8]}... ({sess['message_count']} msgs)"
+            if st.button(label, key=sess["id"]):
+                st.session_state["current_session_id"] = sess["id"]
+                st.rerun()
     except Exception:
         st.warning("Could not fetch sessions.")
 
 # --- Chat Interface ---
 
-import json
-
 # Initialize or Load Session
 if "current_session_id" not in st.session_state:
     # Try to create one if none exists
-    try:
-        res = requests.post(f"{API_BASE_URL}/sessions/")
-        if res.status_code == 200:
-            st.session_state["current_session_id"] = res.json()["session_id"]
-    except:
-        st.error("Backend not reachable.")
+    new_id = history.create_session()
+    st.session_state["current_session_id"] = new_id
 
 current_id = st.session_state.get("current_session_id")
 
 if current_id:
     st.subheader(f"Current Session: `{current_id}`")
     
-    # Load history from backend
-    try:
-        res = requests.get(f"{API_BASE_URL}/sessions/{current_id}")
-        if res.status_code == 200:
-            server_messages = res.json().get("messages", [])
-            # Sync local state with server state
-            st.session_state.messages = server_messages
-        else:
-            st.error("Failed to load session history.")
-    except Exception as e:
-        st.error(f"Error loading history: {e}")
+    # Load history
+    session_data = history.get_session(current_id)
+    if session_data:
+        st.session_state.messages = session_data.get("messages", [])
+    else:
+        st.warning("Session file not found, starting fresh.")
+        st.session_state.messages = []
 
     # Display chat messages
     for message in st.session_state.messages:
         role = message["role"]
-        # Map 'user'/'assistant' to streamlit roles if needed, usually they match
         with st.chat_message(role):
             st.markdown(message["content"])
 
@@ -138,25 +165,40 @@ if current_id:
     if prompt := st.chat_input("Ask a question about your uploaded documents..."):
         # Display user message
         st.chat_message("user").markdown(prompt)
-        # Optimistically append to local state (though we re-fetch on rerun usually)
+        # Append to local state
         st.session_state.messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    payload = {"prompt": prompt, "temperature": temperature}
-                    response = requests.post(f"{API_BASE_URL}/chat/{current_id}", json=payload)
+                    # 1. Load the Base Context
+                    context_file = CONSOLIDATED_DIR / "base_context.md"
                     
-                    if response.status_code == 200:
-                        answer = response.json().get("response", "No response received.")
+                    if not context_file.exists():
+                        st.error("Base context not found. Please run 'Generate Base Context' first.")
+                        answer = "Context missing."
+                    else:
+                        with open(context_file, "r", encoding="utf-8") as f:
+                            context_content = f.read()
+                        
+                        # 2. Chat Logic
+                        response_text = chat_with_data(
+                            user_query=prompt, 
+                            context_content=context_content, 
+                            history=st.session_state.messages,
+                            temperature=temperature
+                        )
+                        
+                        answer = response_text
+                        
+                        # 3. Save interaction
+                        history.save_message(current_id, "user", prompt)
+                        history.save_message(current_id, "assistant", answer)
+                        
                         st.markdown(answer)
                         st.session_state.messages.append({"role": "assistant", "content": answer})
-                    else:
-                        error_msg = f"Error {response.status_code}: {response.text}"
-                        st.error(error_msg)
                 
                 except Exception as e:
-                    error_msg = f"Connection Error: {e}"
-                    st.error(error_msg)
+                    st.error(f"Error: {e}")
 else:
     st.info("Please create a new chat session to start.")
