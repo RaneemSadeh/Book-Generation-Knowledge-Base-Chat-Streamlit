@@ -4,14 +4,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize Gemini
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    # It's possible main.py checked this, but good practice to check here too
-    # or rely on the main config. For now, we load it again to be safe/standalone.
-    pass
+def get_api_key():
+    # Try environment variable first
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        return api_key
+    
+    # Try Streamlit secrets
+    try:
+        import streamlit as st
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except:
+        pass
+    return None
 
-genai.configure(api_key=api_key)
+# Initialize Gemini
+api_key = get_api_key()
+if api_key:
+    genai.configure(api_key=api_key)
 
 MODEL_NAME = "models/gemini-2.5-flash"
 

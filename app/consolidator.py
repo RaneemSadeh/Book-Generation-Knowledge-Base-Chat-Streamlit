@@ -5,12 +5,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize Gemini
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
+def get_api_key():
+    # Try environment variable first
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        return api_key
+    
+    # Try Streamlit secrets
+    try:
+        import streamlit as st
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+        
+    return None
 
-genai.configure(api_key=api_key)
+# Initialize Gemini (lazy load or safe check)
+api_key = get_api_key()
+if api_key:
+    genai.configure(api_key=api_key)
+# We don't raise error here anymore to allow import to succeed
+
 
 # Using the requested model (assumed based on user input/time)
 # Fallback to 1.5-flash if 3.0 fails (handled in try/except or configuration)
@@ -85,6 +103,10 @@ Return ONLY the structured Markdown content.
 """
 
 def generate_summary(combined_text: str) -> str:
+    # Ensure API key is configured
+    if not get_api_key():
+         raise ValueError("GEMINI_API_KEY is missing. Please set it in .env or Streamlit Secrets.")
+
     try:
         print(f"DEBUG: Using model {MODEL_NAME}")
         model = genai.GenerativeModel(
